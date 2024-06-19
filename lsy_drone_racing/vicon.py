@@ -9,7 +9,11 @@ from rosgraph import Master
 from tf2_msgs.msg import TFMessage
 
 from lsy_drone_racing.import_utils import get_ros_package_path
+<<<<<<< HEAD
 from lsy_drone_racing.utils import euler_from_quaternion, map2pi
+=======
+from lsy_drone_racing.rotations import euler_from_quaternion, map2pi
+>>>>>>> 8c8d8525fae512a7bfc83e0b493807093e87c294
 
 
 class Vicon:
@@ -70,12 +74,20 @@ class Vicon:
         """
         for tf in data.transforms:
             name = tf.child_frame_id.split("/")[-1]
+<<<<<<< HEAD
             if name not in self.pos:
+=======
+            if name not in self.track_names:
+>>>>>>> 8c8d8525fae512a7bfc83e0b493807093e87c294
                 continue
             T, R = tf.transform.translation, tf.transform.rotation
             pos = np.array([T.x, T.y, T.z])
             rpy = np.array(euler_from_quaternion(R.x, R.y, R.z, R.w))
+<<<<<<< HEAD
             if self.pos[name]:
+=======
+            if self.pos.get(name) is not None:
+>>>>>>> 8c8d8525fae512a7bfc83e0b493807093e87c294
                 self.vel[name] = (pos - self.pos[name]) / (time.time() - self.time[name])
                 self.ang_vel[name] = map2pi(rpy - self.rpy[name]) / (time.time() - self.time[name])
             self.time[name] = time.time()
