@@ -33,7 +33,7 @@ def simulate(
     controller: str = "examples/controller.py",
     n_runs: int = 1,
     gui: bool = True,
-    terminate_on_lap: bool = True,
+    terminate_on_lap: bool = False,
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
