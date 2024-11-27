@@ -33,6 +33,7 @@ import numpy as np
 from gymnasium import spaces
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.sim.physics import PhysicsMode
 from lsy_drone_racing.sim.sim import Sim
 from lsy_drone_racing.utils import check_gate_pass
 
@@ -133,6 +134,8 @@ class DroneRacingEnv(gymnasium.Env):
         Returns:
             Observation and info.
         """
+        # The system identification model is based on the attitude control interface. We cannot
+        # support its use with the full state control interface
         if self.config.env.reseed:
             self.sim.seed(self.config.env.seed)
         if seed is not None:
@@ -163,6 +166,9 @@ class DroneRacingEnv(gymnasium.Env):
             action: Full-state command [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate]
                 to follow.
         """
+        assert (
+            self.config.sim.physics != PhysicsMode.SYS_ID
+        ), "sys_id model not supported for full state control interface"
         action = action.astype(np.float64)  # Drone firmware expects float64
         assert action.shape == self.action_space.shape, f"Invalid action shape: {action.shape}"
         pos, vel, acc, yaw, rpy_rate = action[:3], action[3:6], action[6:9], action[9], action[10:]
@@ -208,7 +214,7 @@ class DroneRacingEnv(gymnasium.Env):
             "vel": self.sim.drone.vel.astype(np.float32),
             "ang_vel": self.sim.drone.ang_vel.astype(np.float32),
         }
-        obs["ang_vel"][:] = R.from_euler("XYZ", obs["rpy"]).inv().apply(obs["ang_vel"])
+        obs["ang_vel"][:] = R.from_euler("xyz", obs["rpy"]).apply(obs["ang_vel"], inverse=True)
 
         gates = self.sim.gates
         obs["target_gate"] = self.target_gate if self.target_gate < len(gates) else -1
@@ -256,8 +262,8 @@ class DroneRacingEnv(gymnasium.Env):
             True if the drone is out of bounds, colliding with an obstacle, or has passed all gates,
             else False.
         """
-        state = {k: getattr(self.sim.drone, k).copy() for k in ("pos", "rpy", "vel", "ang_vel")}
-        state["ang_vel"] = R.from_euler("XYZ", state["rpy"]).apply(state["ang_vel"])
+        state = {k: getattr(self.sim.drone, k).copy() for k in self.sim.state_space}
+        state["ang_vel"] = R.from_euler("xyz", state["rpy"]).apply(state["ang_vel"], inverse=True)
         if state not in self.sim.state_space:
             return True  # Drone is out of bounds
         if self.sim.collisions:
@@ -322,11 +328,23 @@ class DroneRacingThrustEnv(DroneRacingEnv):
         """
         assert action.shape == self.action_space.shape, f"Invalid action shape: {action.shape}"
         action = action.astype(np.float64)
-        cmd_thrust = action[0]
-        # Crazyflie expects negated pitch command. TODO: Check why this is the case and fix this on
-        # the firmware side if possible.
-        cmd_rpy = action[1:] * np.array([1, -1, 1])
-        self.sim.drone.collective_thrust_cmd(cmd_thrust, cmd_rpy)
-        collision = self._inner_step_loop()
+        collision = False
+        # We currently need to differentiate between the sys_id backend and all others because the
+        # simulation step size is different for the sys_id backend (we do not substep in the
+        # identified model). In future iterations, the sim API should be flexible to handle both
+        # cases without an explicit step_sys_id function.
+        if self.config.sim.physics == "sys_id":
+            cmd_thrust, cmd_rpy = action[0], action[1:]
+            self.sim.step_sys_id(cmd_thrust, cmd_rpy, 1 / self.config.env.freq)
+            self.target_gate += self.gate_passed()
+            if self.target_gate == self.sim.n_gates:
+                self.target_gate = -1
+            self._last_drone_pos[:] = self.sim.drone.pos
+        else:
+            # Crazyflie firmware expects negated pitch command. TODO: Check why this is the case and
+            # fix this on the firmware side if possible.
+            cmd_thrust, cmd_rpy = action[0], action[1:] * np.array([1, -1, 1])
+            self.sim.drone.collective_thrust_cmd(cmd_thrust, cmd_rpy)
+            collision = self._inner_step_loop()
         terminated = self.terminated or collision
         return self.obs, self.reward, terminated, False, self.info

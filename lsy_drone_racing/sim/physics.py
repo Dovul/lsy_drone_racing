@@ -14,6 +14,7 @@ data-driven models.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -36,12 +37,31 @@ class PhysicsMode(str, Enum):
     """Physics implementations enumeration class."""
 
     PYB = "pyb"  # Base PyBullet physics update.
+    DEFAULT = PYB  # Default physics mode.
     DYN = "dyn"  # Update with an explicit model of the dynamics.
     PYB_GND = "pyb_gnd"  # PyBullet physics update with ground effect.
     PYB_DRAG = "pyb_drag"  # PyBullet physics update with drag.
     PYB_DW = "pyb_dw"  # PyBullet physics update with downwash.
     # PyBullet physics update with ground effect, drag, and downwash.
     PYB_GND_DRAG_DW = "pyb_gnd_drag_dw"
+    SYS_ID = "sys_id"  # System identification dynamics model.
+
+
+@dataclass
+class SystemIdentificationParams:
+    """Parameters for the system identification dynamics model."""
+
+    acc_k1: float = 20.91
+    acc_k2: float = 3.65
+    roll_alpha: float = -3.96
+    roll_beta: float = 4.08
+    pitch_alpha: float = -6.00
+    pitch_beta: float = 6.21
+    yaw_alpha: float = 0.00
+    yaw_beta: float = 0.00
+
+
+SYS_ID_PARAMS = SystemIdentificationParams()
 
 
 def force_torques(
@@ -70,6 +90,8 @@ def force_torques(
         return motors(drone, rpms) + downwash(drone, [])
     elif mode == PhysicsMode.PYB_GND_DRAG_DW:
         return motors(drone, rpms) + drag(drone, rpms) + downwash(drone, [])
+    elif mode in PhysicsMode.SYS_ID:
+        raise ValueError(f"Physics mode {mode} not supported for force/torque calculation.")
     raise NotImplementedError(f"Physics mode {mode} not implemented.")
 
 
@@ -106,13 +128,12 @@ def dynamics(drone: Drone, rpms: NDArray[np.floating], dt: float) -> list[tuple[
     pos = drone.pos
     rpy = drone.rpy
     vel = drone.vel
-    rpy_rates = drone.ang_vel
-    rotation = R.from_euler("XYZ", rpy).as_matrix()
+    rpy_rates = R.from_euler("xyz", rpy).apply(drone.ang_vel, inverse=True)  # Now in body frame
     # Compute forces and torques.
     forces = np.array(rpms**2) * drone.params.kf
     thrust = np.array([0, 0, np.sum(forces)])
-    thrust_world_frame = np.dot(rotation, thrust)
-    force_world_frame = thrust_world_frame - np.array([0, 0, GRAVITY])
+    thrust_world_frame = R.from_euler("xyz", rpy).apply(thrust)
+    force_world_frame = thrust_world_frame - np.array([0, 0, GRAVITY * drone.params.mass])
     z_torques = np.array(rpms**2) * drone.params.km
     z_torque = z_torques[0] - z_torques[1] + z_torques[2] - z_torques[3]
     L = drone.params.arm_len
@@ -121,15 +142,50 @@ def dynamics(drone: Drone, rpms: NDArray[np.floating], dt: float) -> list[tuple[
     torques = np.array([x_torque, y_torque, z_torque])
     torques = torques - np.cross(rpy_rates, np.dot(drone.params.J, rpy_rates))
     rpy_rates_deriv = np.dot(drone.params.J_inv, torques)
-    no_pybullet_dyn_accs = force_world_frame / drone.params.mass
+    acc = force_world_frame / drone.params.mass
     # Update state.
-    vel = vel + no_pybullet_dyn_accs * dt
+    vel = vel + acc * dt
     rpy_rates = rpy_rates + rpy_rates_deriv * dt
     drone.pos[:] = pos + vel * dt
     drone.rpy[:] = rpy + rpy_rates * dt
     drone.vel[:] = vel
-    drone.ang_vel[:] = rpy_rates
+    drone.ang_vel[:] = R.from_euler("xyz", rpy).apply(rpy_rates)
     return []  # No forces/torques to apply. We set the drone state directly.
+
+
+def sys_id_dynamics(
+    drone: Drone, collective_thrust: float, attitude: NDArray[np.floating], dt: float
+) -> list[tuple[int, ForceTorque]]:
+    """Dynamics model identified from data collected on the real drone.
+
+    Contrary to the other physics implementations, this function is not based on a physical model.
+    Instead, we fit a linear model to the data collected on the real drone, and predict the next
+    state based on the control inputs and the current state.
+
+    Note:
+        We do not explicitly simulate the onboard controller for this model. Instead, we assume that
+        its dynamics are implicitly captured by the linear model.
+
+    Args:
+        drone: The target drone to calculate the physics for.
+        collective_thrust: The summed thrust from all rotors.
+        attitude: The desired drone orientation.
+        dt: The dynamics time step.
+    """
+    rot = R.from_euler("xyz", drone.rpy)
+    thrust = rot.apply(np.array([0, 0, collective_thrust]))
+    drift = rot.apply(np.array([0, 0, 1]))
+    acc = thrust * SYS_ID_PARAMS.acc_k1 + drift * SYS_ID_PARAMS.acc_k2 - np.array([0, 0, GRAVITY])
+    roll_cmd, pitch_cmd, yaw_cmd = attitude
+    roll_rate = SYS_ID_PARAMS.roll_alpha * drone.rpy[0] + SYS_ID_PARAMS.roll_beta * roll_cmd
+    pitch_rate = SYS_ID_PARAMS.pitch_alpha * drone.rpy[1] + SYS_ID_PARAMS.pitch_beta * pitch_cmd
+    yaw_rate = SYS_ID_PARAMS.yaw_alpha * drone.rpy[2] + SYS_ID_PARAMS.yaw_beta * yaw_cmd
+    rpy_rates = np.array([roll_rate, pitch_rate, yaw_rate])
+    drone.pos[:] = drone.pos + drone.vel * dt
+    drone.rpy[:] = drone.rpy + rpy_rates * dt
+    drone.vel[:] = drone.vel + acc * dt
+    drone.ang_vel[:] = R.from_euler("xyz", drone.rpy).apply(rpy_rates)
+    return []
 
 
 def downwash(drone: Drone, other_drones: list[Drone]) -> list[tuple[int, ForceTorque]]:
@@ -171,10 +227,9 @@ def drag(drone: Drone, rpms: NDArray[np.floating]) -> list[tuple[int, ForceTorqu
     Returns:
         A list of tuples containing the link id and a force/torque tuple.
     """
-    rot = R.from_euler("XYZ", drone.rpy).as_matrix()
     # Simple draft model applied to the base/center of mass
     drag_factors = -1 * drone.params.drag_coeff * np.sum(np.array(2 * np.pi * rpms / 60))
-    drag = np.dot(rot, drag_factors * np.array(drone.vel))
+    drag = R.from_euler("xyz", drone.rpy).apply(drag_factors * np.array(drone.vel))
     return [(4, ForceTorque(drag, [0, 0, 0]))]
 
 
@@ -260,10 +315,10 @@ def pybullet_step(pyb_client: int, drone: Drone, mode: PhysicsMode):
         drone: The target drone to apply the forces and torques to.
         mode: The physics mode to use for the simulation step
     """
-    if mode != PhysicsMode.DYN:
-        p.stepSimulation(physicsClientId=pyb_client)
-    elif mode == PhysicsMode.DYN:
+    if mode == PhysicsMode.DYN or mode == PhysicsMode.SYS_ID:
         p.resetBasePositionAndOrientation(
             drone.id, drone.pos, p.getQuaternionFromEuler(drone.rpy), physicsClientId=pyb_client
         )
         p.resetBaseVelocity(drone.id, drone.vel, drone.ang_vel, physicsClientId=pyb_client)
+    else:
+        p.stepSimulation(physicsClientId=pyb_client)

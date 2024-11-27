@@ -14,7 +14,6 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
-import numpy.typing as npt
 import pybullet as p
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
@@ -31,7 +30,7 @@ class ThrustController(BaseController):
     Modified from https://github.com/utiasDSL/crazyswarm-import/blob/ad2f7ea987f458a504248a1754b124ba39fc2f21/ros_ws/src/crazyswarm/scripts/position_ctl_m.py
     """
 
-    def __init__(self, initial_obs: npt.NDArray[np.floating], initial_info: dict):
+    def __init__(self, initial_obs: dict[str, NDArray[np.floating]], initial_info: dict):
         """Initialization of the controller.
 
         Args:
@@ -79,8 +78,9 @@ class ThrustController(BaseController):
         self.z_des = cs_z(ts)
 
         try:
-            # Draw interpolated Trajectory
-            trajectory = np.vstack([self.x_des, self.y_des, self.z_des]).T
+            # Draw interpolated Trajectory. Limit segments to avoid excessive drawings
+            stride = max(1, len(self.x_des) // 100)
+            trajectory = np.vstack([self.x_des, self.y_des, self.z_des])[..., ::stride].T
             for i in range(len(trajectory) - 1):
                 p.addUserDebugLine(
                     trajectory[i],
@@ -94,8 +94,8 @@ class ThrustController(BaseController):
             ...  # Ignore pybullet errors if not running in the pybullet GUI
 
     def compute_control(
-        self, obs: npt.NDArray[np.floating], info: dict | None = None
-    ) -> npt.NDarray[np.floating]:
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+    ) -> NDArray[np.floating]:
         """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
 
         Args:
@@ -128,8 +128,7 @@ class ThrustController(BaseController):
         target_thrust[2] += self.drone_mass * self.g
 
         # Update z_axis to the current orientation of the drone
-        rpy = obs["rpy"]
-        z_axis = R.from_euler("xyz", [rpy[0], rpy[1], rpy[2]]).as_matrix()[:, 2]
+        z_axis = R.from_euler("xyz", obs["rpy"]).as_matrix()[:, 2]
 
         # update current thrust
         thrust_desired = target_thrust.dot(z_axis)
@@ -151,7 +150,7 @@ class ThrustController(BaseController):
     def step_callback(
         self,
         action: NDArray[np.floating],
-        obs: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
         reward: float,
         terminated: bool,
         truncated: bool,
