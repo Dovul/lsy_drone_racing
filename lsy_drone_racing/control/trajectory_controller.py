@@ -99,6 +99,7 @@ class TrajectoryController(BaseController):
         info: dict,
     ):
         """Increment the time step counter."""
+        
         self._tick += 1
 
     def episode_reset(self):
