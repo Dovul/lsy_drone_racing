@@ -5,7 +5,7 @@ from stable_baselines3.common.env_util import make_vec_env
 
 models_dir = "models/PPO"
 
-model_path = f"{models_dir}/700000.zip"
+model_path = f"{models_dir}/400000.zip"
 
 
 vec_env =make_vec_env("LunarLander-v2")
